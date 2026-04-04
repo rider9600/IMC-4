@@ -1,0 +1,16 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python analyze_data\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python backtest\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -m py_compile strategy\\.py datamodel\\.py analyze_data\\.py backtest\\.py; echo \"All files compiled successfully!\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
