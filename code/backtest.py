@@ -26,21 +26,31 @@ class SimpleBacktester:
             return sum(prices) / len(prices) if prices else None
         return sum(prices[-window:]) / window
 
-    def get_signal(self, product: str, current_price: float, moving_avg: float) -> int:
+    def get_signal(self, product: str, current_price: float, price_history: List[float]) -> int:
         """
-        Generate trading signal.
+        Generate trading signal using std deviation-based thresholds.
         Returns: 1 (buy), -1 (sell), 0 (hold)
         """
-        if moving_avg is None:
+        if len(price_history) < 2:
             return 0
-
+        
+        import statistics
+        mean_price = sum(price_history) / len(price_history)
+        std_dev = statistics.stdev(price_history)
+        
+        if std_dev == 0:
+            return 0
+        
+        # Use standard deviation-based thresholds
         if product == "TOMATOES":
-            buy_threshold = 0.98 * moving_avg
-            sell_threshold = 1.02 * moving_avg
+            # TOMATOES: more volatile, use 0.4 std thresholds
+            buy_threshold = mean_price - 0.4 * std_dev
+            sell_threshold = mean_price + 0.4 * std_dev
         else:  # EMERALDS
-            buy_threshold = 0.995 * moving_avg
-            sell_threshold = 1.005 * moving_avg
-
+            # EMERALDS: very stable, use 0.5 std thresholds
+            buy_threshold = mean_price - 0.5 * std_dev
+            sell_threshold = mean_price + 0.5 * std_dev
+        
         if current_price < buy_threshold:
             return 1  # BUY
         elif current_price > sell_threshold:
@@ -72,13 +82,8 @@ class SimpleBacktester:
                 if len(self.price_history[product]) > 50:
                     self.price_history[product] = self.price_history[product][-50:]
 
-                # Calculate moving average
-                moving_avg = self.calculate_moving_average(
-                    self.price_history[product], window=20
-                )
-
                 # Get trading signal
-                signal = self.get_signal(product, mid_price, moving_avg)
+                signal = self.get_signal(product, mid_price, self.price_history[product])
 
                 if signal == 1:  # BUY signal
                     results["signals"]["BUY"] += 1

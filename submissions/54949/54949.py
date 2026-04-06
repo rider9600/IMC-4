@@ -49,11 +49,6 @@ class Trader:
             return best_ask
         return 5000 if product == "TOMATOES" else 10000
 
-    def _best_bid_ask(self, order_depth: OrderDepth) -> Tuple[int, int]:
-        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-        best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
-        return best_bid, best_ask
-
     def _stats(self, prices: List[float]) -> Tuple[float, float]:
         if len(prices) < 8:
             return None, None
@@ -114,36 +109,26 @@ class Trader:
 
         params = {
             "TOMATOES": {
-                "long_limit": 38,
-                "short_limit": 55,
-                "order_size": 6,
-                "entry_k": 0.65,
+                "pos_limit": 60,
+                "order_size": 8,
+                "entry_k": 0.60,
                 "exit_k": 0.20,
-                "stop_k": 1.00,
+                "stop_k": 1.15,
                 "max_hold_ms": 3500,
                 "cooldown_ms": 700,
-                "near_close_ts": 180000,
-                "hard_close_ts": 190000,
-                "min_edge_spread_mult": 0.35,
-                "trend_filter_k": 0.35,
-                "trend_alpha": 0.55,
-                "late_day_bearish_shift": 0.18,
+                "near_close_ts": 188000,
+                "hard_close_ts": 196000,
             },
             "EMERALDS": {
-                "long_limit": 30,
-                "short_limit": 30,
-                "order_size": 5,
-                "entry_k": 0.75,
+                "pos_limit": 40,
+                "order_size": 6,
+                "entry_k": 0.70,
                 "exit_k": 0.25,
-                "stop_k": 0.90,
+                "stop_k": 1.00,
                 "max_hold_ms": 5000,
                 "cooldown_ms": 900,
-                "near_close_ts": 180000,
-                "hard_close_ts": 190000,
-                "min_edge_spread_mult": 0.25,
-                "trend_filter_k": 0.30,
-                "trend_alpha": 0.20,
-                "late_day_bearish_shift": 0.00,
+                "near_close_ts": 188000,
+                "hard_close_ts": 196000,
             },
         }
 
@@ -154,7 +139,6 @@ class Trader:
             current_pos = state.position.get(product, 0)
             prev_pos = last_pos.get(product, 0)
             mid = self._mid_price(order_depth, product)
-            best_bid, best_ask = self._best_bid_ask(order_depth)
 
             if product not in price_history:
                 price_history[product] = []
@@ -195,6 +179,24 @@ class Trader:
                 last_pos[product] = current_pos
                 continue
 
+            # Stop-loss based on adverse move relative to rolling mean.
+            stop_loss_triggered = False
+            if current_pos > 0 and mid < mean_price - p["stop_k"] * std_price:
+                reduce_qty = min(abs(current_pos), p["order_size"] * 2)
+                orders.extend(self._sell_to_bids(product, order_depth, reduce_qty))
+                cooldown_until[product] = state.timestamp + p["cooldown_ms"]
+                stop_loss_triggered = True
+            elif current_pos < 0 and mid > mean_price + p["stop_k"] * std_price:
+                reduce_qty = min(abs(current_pos), p["order_size"] * 2)
+                orders.extend(self._buy_from_asks(product, order_depth, reduce_qty))
+                cooldown_until[product] = state.timestamp + p["cooldown_ms"]
+                stop_loss_triggered = True
+
+            if stop_loss_triggered:
+                result[product] = orders
+                last_pos[product] = current_pos
+                continue
+
             # Time stop: do not hold one-direction inventory for too long.
             hold_time = state.timestamp - entry_ts.get(product, state.timestamp)
             if current_pos != 0 and hold_time > p["max_hold_ms"]:
@@ -208,55 +210,12 @@ class Trader:
                 continue
 
             in_cooldown = state.timestamp < cooldown_until.get(product, -1)
-
-            spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else 2
-            min_edge = max(1.0, p["min_edge_spread_mult"] * spread)
-
-            # Simple trend filter: avoid fading strong directional moves.
-            trend = 0.0
-            if len(price_history[product]) >= 16:
-                recent = price_history[product][-8:]
-                older = price_history[product][-16:-8]
-                trend = (sum(recent) / len(recent)) - (sum(older) / len(older))
-
-            fair_price = mean_price + p["trend_alpha"] * trend
-            if state.timestamp >= 120000:
-                fair_price -= p["late_day_bearish_shift"] * std_price
-
-            strong_up = trend > p["trend_filter_k"] * std_price
-            strong_down = trend < -p["trend_filter_k"] * std_price
-
-            long_limit = p["long_limit"]
-            short_limit = p["short_limit"]
-
-            # Use fair value for stops as well, so stop-loss adapts to trend regime.
-            stop_loss_triggered = False
-            if current_pos > 0 and mid < fair_price - p["stop_k"] * std_price:
-                reduce_qty = min(abs(current_pos), p["order_size"] * 2)
-                orders.extend(self._sell_to_bids(product, order_depth, reduce_qty))
-                cooldown_until[product] = state.timestamp + p["cooldown_ms"]
-                stop_loss_triggered = True
-            elif current_pos < 0 and mid > fair_price + p["stop_k"] * std_price:
-                reduce_qty = min(abs(current_pos), p["order_size"] * 2)
-                orders.extend(self._buy_from_asks(product, order_depth, reduce_qty))
-                cooldown_until[product] = state.timestamp + p["cooldown_ms"]
-                stop_loss_triggered = True
-
-            if stop_loss_triggered:
-                result[product] = orders
-                last_pos[product] = current_pos
-                continue
-
-            inv_den = max(1, short_limit if current_pos < 0 else long_limit)
-            inv_ratio = abs(current_pos) / inv_den
-            buy_k = p["entry_k"] + (0.5 * max(0, current_pos) / max(1, long_limit))
-            sell_k = p["entry_k"] + (0.5 * max(0, -current_pos) / max(1, short_limit))
-            buy_threshold = fair_price - buy_k * std_price
-            sell_threshold = fair_price + sell_k * std_price
+            buy_threshold = mean_price - p["entry_k"] * std_price
+            sell_threshold = mean_price + p["entry_k"] * std_price
             flat_band = p["exit_k"] * std_price
 
             # Mean reversion exits first when close to fair value.
-            if abs(mid - fair_price) <= flat_band and current_pos != 0:
+            if abs(mid - mean_price) <= flat_band and current_pos != 0:
                 reduce_qty = min(abs(current_pos), p["order_size"])
                 if current_pos > 0:
                     orders.extend(self._sell_to_bids(product, order_depth, reduce_qty))
@@ -264,19 +223,12 @@ class Trader:
                     orders.extend(self._buy_from_asks(product, order_depth, reduce_qty))
             elif not in_cooldown:
                 # New entries only outside cooldown.
-                if mid < buy_threshold and current_pos < long_limit and not strong_down:
-                    if best_ask is not None and (fair_price - best_ask) >= min_edge:
-                        qty = min(p["order_size"], long_limit - current_pos)
-                        # Reduce adding size when inventory is already non-trivial.
-                        qty = max(0, int(qty * (1.0 - 0.4 * inv_ratio)))
-                        if qty > 0:
-                            orders.extend(self._buy_from_asks(product, order_depth, qty, int(fair_price)))
-                elif mid > sell_threshold and current_pos > -short_limit and not strong_up:
-                    if best_bid is not None and (best_bid - fair_price) >= min_edge:
-                        qty = min(p["order_size"], short_limit + current_pos)
-                        qty = max(0, int(qty * (1.0 - 0.4 * inv_ratio)))
-                        if qty > 0:
-                            orders.extend(self._sell_to_bids(product, order_depth, qty, int(fair_price)))
+                if mid < buy_threshold and current_pos < p["pos_limit"]:
+                    qty = min(p["order_size"], p["pos_limit"] - current_pos)
+                    orders.extend(self._buy_from_asks(product, order_depth, qty))
+                elif mid > sell_threshold and current_pos > -p["pos_limit"]:
+                    qty = min(p["order_size"], p["pos_limit"] + current_pos)
+                    orders.extend(self._sell_to_bids(product, order_depth, qty))
 
             result[product] = orders
             last_pos[product] = current_pos

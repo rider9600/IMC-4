@@ -1,6 +1,9 @@
 """
-Algorithmic Trading Strategy for Prosperity 4
-Mean-reversion with explicit stop-loss, cooldown, and end-of-day de-risking.
+CSV-trend-informed strategy for Prosperity 4.
+
+Built from observed movement in data/prices_round_0_day_-1.csv and day_-2:
+- TOMATOES: net bearish drift with alternating down/up time segments.
+- EMERALDS: mostly flat around fair value.
 """
 
 from datamodel import OrderDepth, TradingState, Order
@@ -11,7 +14,7 @@ import statistics
 
 class Trader:
     def __init__(self):
-        self.max_history = 40
+        self.max_history = 48
 
     def bid(self) -> int:
         return 15
@@ -31,7 +34,6 @@ class Trader:
             if isinstance(decoded, dict) and "price_history" in decoded:
                 state.update(decoded)
             elif isinstance(decoded, dict):
-                # Backward compatibility with previous saved format.
                 state["price_history"] = decoded
         except Exception:
             pass
@@ -55,7 +57,7 @@ class Trader:
         return best_bid, best_ask
 
     def _stats(self, prices: List[float]) -> Tuple[float, float]:
-        if len(prices) < 8:
+        if len(prices) < 10:
             return None, None
         mean_price = sum(prices) / len(prices)
         std_price = statistics.stdev(prices)
@@ -103,6 +105,15 @@ class Trader:
                 remaining -= qty
         return orders
 
+    def _time_segment(self, timestamp: int) -> int:
+        # 0..4 over a 200k session
+        seg = timestamp // 40000
+        if seg < 0:
+            return 0
+        if seg > 4:
+            return 4
+        return seg
+
     def run(self, state: TradingState) -> tuple:
         persisted = self._load_state(state.traderData)
         price_history = persisted["price_history"]
@@ -114,36 +125,34 @@ class Trader:
 
         params = {
             "TOMATOES": {
-                "long_limit": 38,
-                "short_limit": 55,
+                "base_long_limit": 35,
+                "base_short_limit": 55,
                 "order_size": 6,
-                "entry_k": 0.65,
-                "exit_k": 0.20,
-                "stop_k": 1.00,
-                "max_hold_ms": 3500,
+                "entry_k": 0.70,
+                "exit_k": 0.25,
+                "stop_k": 0.95,
+                "max_hold_ms": 3200,
                 "cooldown_ms": 700,
-                "near_close_ts": 180000,
-                "hard_close_ts": 190000,
-                "min_edge_spread_mult": 0.35,
+                "near_close_ts": 176000,
+                "hard_close_ts": 188000,
+                "min_edge_spread_mult": 0.30,
                 "trend_filter_k": 0.35,
-                "trend_alpha": 0.55,
-                "late_day_bearish_shift": 0.18,
+                "trend_alpha": 0.60,
             },
             "EMERALDS": {
-                "long_limit": 30,
-                "short_limit": 30,
-                "order_size": 5,
-                "entry_k": 0.75,
+                "base_long_limit": 26,
+                "base_short_limit": 26,
+                "order_size": 4,
+                "entry_k": 0.80,
                 "exit_k": 0.25,
-                "stop_k": 0.90,
-                "max_hold_ms": 5000,
+                "stop_k": 0.85,
+                "max_hold_ms": 4800,
                 "cooldown_ms": 900,
-                "near_close_ts": 180000,
-                "hard_close_ts": 190000,
-                "min_edge_spread_mult": 0.25,
-                "trend_filter_k": 0.30,
+                "near_close_ts": 176000,
+                "hard_close_ts": 188000,
+                "min_edge_spread_mult": 0.22,
+                "trend_filter_k": 0.28,
                 "trend_alpha": 0.20,
-                "late_day_bearish_shift": 0.00,
             },
         }
 
@@ -155,6 +164,7 @@ class Trader:
             prev_pos = last_pos.get(product, 0)
             mid = self._mid_price(order_depth, product)
             best_bid, best_ask = self._best_bid_ask(order_depth)
+            seg = self._time_segment(state.timestamp)
 
             if product not in price_history:
                 price_history[product] = []
@@ -168,13 +178,12 @@ class Trader:
                 last_pos[product] = current_pos
                 continue
 
-            # Track time when a fresh position is opened or direction flips.
             if current_pos != 0 and (prev_pos == 0 or (prev_pos > 0) != (current_pos > 0)):
                 entry_ts[product] = state.timestamp
             if current_pos == 0:
                 entry_ts[product] = state.timestamp
 
-            # End-of-day inventory risk reduction.
+            # End-of-day de-risking
             if state.timestamp >= p["hard_close_ts"] and current_pos != 0:
                 close_qty = abs(current_pos)
                 if current_pos > 0:
@@ -195,7 +204,6 @@ class Trader:
                 last_pos[product] = current_pos
                 continue
 
-            # Time stop: do not hold one-direction inventory for too long.
             hold_time = state.timestamp - entry_ts.get(product, state.timestamp)
             if current_pos != 0 and hold_time > p["max_hold_ms"]:
                 reduce_qty = min(abs(current_pos), p["order_size"])
@@ -212,7 +220,6 @@ class Trader:
             spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else 2
             min_edge = max(1.0, p["min_edge_spread_mult"] * spread)
 
-            # Simple trend filter: avoid fading strong directional moves.
             trend = 0.0
             if len(price_history[product]) >= 16:
                 recent = price_history[product][-8:]
@@ -220,16 +227,30 @@ class Trader:
                 trend = (sum(recent) / len(recent)) - (sum(older) / len(older))
 
             fair_price = mean_price + p["trend_alpha"] * trend
-            if state.timestamp >= 120000:
-                fair_price -= p["late_day_bearish_shift"] * std_price
+
+            # CSV-informed intraday regime bias for TOMATOES:
+            # segments 0,2,4 bearish; 1,3 mild rebound.
+            if product == "TOMATOES":
+                if seg in (0, 2, 4):
+                    fair_price -= 0.20 * std_price
+                else:
+                    fair_price += 0.07 * std_price
 
             strong_up = trend > p["trend_filter_k"] * std_price
             strong_down = trend < -p["trend_filter_k"] * std_price
 
-            long_limit = p["long_limit"]
-            short_limit = p["short_limit"]
+            # Regime-adaptive inventory limits
+            long_limit = p["base_long_limit"]
+            short_limit = p["base_short_limit"]
+            if product == "TOMATOES":
+                if seg in (0, 2, 4):
+                    long_limit = max(22, long_limit - 8)
+                    short_limit = min(60, short_limit + 3)
+                else:
+                    long_limit = min(42, long_limit + 4)
+                    short_limit = max(45, short_limit - 2)
 
-            # Use fair value for stops as well, so stop-loss adapts to trend regime.
+            # Trend-adjusted stop-loss
             stop_loss_triggered = False
             if current_pos > 0 and mid < fair_price - p["stop_k"] * std_price:
                 reduce_qty = min(abs(current_pos), p["order_size"] * 2)
@@ -249,13 +270,13 @@ class Trader:
 
             inv_den = max(1, short_limit if current_pos < 0 else long_limit)
             inv_ratio = abs(current_pos) / inv_den
-            buy_k = p["entry_k"] + (0.5 * max(0, current_pos) / max(1, long_limit))
-            sell_k = p["entry_k"] + (0.5 * max(0, -current_pos) / max(1, short_limit))
+            buy_k = p["entry_k"] + (0.50 * max(0, current_pos) / max(1, long_limit))
+            sell_k = p["entry_k"] + (0.50 * max(0, -current_pos) / max(1, short_limit))
             buy_threshold = fair_price - buy_k * std_price
             sell_threshold = fair_price + sell_k * std_price
             flat_band = p["exit_k"] * std_price
 
-            # Mean reversion exits first when close to fair value.
+            # Exit priority near fair value
             if abs(mid - fair_price) <= flat_band and current_pos != 0:
                 reduce_qty = min(abs(current_pos), p["order_size"])
                 if current_pos > 0:
@@ -263,18 +284,17 @@ class Trader:
                 else:
                     orders.extend(self._buy_from_asks(product, order_depth, reduce_qty))
             elif not in_cooldown:
-                # New entries only outside cooldown.
                 if mid < buy_threshold and current_pos < long_limit and not strong_down:
                     if best_ask is not None and (fair_price - best_ask) >= min_edge:
                         qty = min(p["order_size"], long_limit - current_pos)
-                        # Reduce adding size when inventory is already non-trivial.
-                        qty = max(0, int(qty * (1.0 - 0.4 * inv_ratio)))
+                        qty = max(0, int(qty * (1.0 - 0.45 * inv_ratio)))
                         if qty > 0:
                             orders.extend(self._buy_from_asks(product, order_depth, qty, int(fair_price)))
+
                 elif mid > sell_threshold and current_pos > -short_limit and not strong_up:
                     if best_bid is not None and (best_bid - fair_price) >= min_edge:
                         qty = min(p["order_size"], short_limit + current_pos)
-                        qty = max(0, int(qty * (1.0 - 0.4 * inv_ratio)))
+                        qty = max(0, int(qty * (1.0 - 0.45 * inv_ratio)))
                         if qty > 0:
                             orders.extend(self._sell_to_bids(product, order_depth, qty, int(fair_price)))
 
